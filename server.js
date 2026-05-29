@@ -247,7 +247,7 @@ app.get('*', (req, res) => {
 });
 
 // ===== 启动 =====
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🚀 GEO资讯服务已启动`);
   console.log(`   地址: http://localhost:${PORT}`);
   console.log(`   数据: http://localhost:${PORT}/api/data\n`);
