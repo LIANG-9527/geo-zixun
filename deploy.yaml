@@ -1,0 +1,397 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: geo-zixun-server
+data:
+  package.json: |
+    {
+      "name": "geo-zixun",
+      "version": "1.0.0",
+      "main": "server.js",
+      "dependencies": {
+        "express": "^4.21.0"
+      }
+    }
+  server.js: |
+    /**
+     * GEO资讯 - 动态服务端
+     * 实时从 ima OpenAPI 拉取 LIANG-AI 知识库数据
+     */
+    const express = require('express');
+    const https = require('https');
+    const path = require('path');
+
+    const app = express();
+    const PORT = process.env.PORT || 3000;
+    const IMA_BASE = 'https://ima.qq.com/openapi/wiki/v1';
+    const IMA_CLIENT_ID = '5658e70b495f5226921bd8cb0acb48bb';
+    const IMA_API_KEY = 'Ll0kh/v5fbGlHgPFVWaU/lz7Cc6yRVvrn28NX+J3BCMl1D9UMim+Qvt8q/kFN2pCL0zlgd5fXg==';
+    const TARGET_KB = 'LIANG-AI';
+
+    let cache = { data: null, updatedAt: null, ttl: 60 * 60 * 1000 };
+
+    app.use(express.json());
+    app.use(express.static(path.join(__dirname, 'public')));
+
+    function imaRequest(endpoint, body) {
+      return new Promise((resolve, reject) => {
+        const url = new URL(IMA_BASE + '/' + endpoint);
+        const postData = JSON.stringify(body);
+        const options = {
+          hostname: url.hostname, port: 443, path: url.pathname, method: 'POST',
+          headers: {
+            'ima-openapi-clientid': IMA_CLIENT_ID,
+            'ima-openapi-apikey': IMA_API_KEY,
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(postData)
+          }
+        };
+        const req = https.request(options, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => {
+            try {
+              const json = JSON.parse(data);
+              if (json.code === 0) resolve(json.data);
+              else reject(new Error('API Error [' + json.code + ']: ' + json.msg));
+            } catch (e) { reject(new Error('Parse: ' + e.message)); }
+          });
+        });
+        req.setTimeout(15000, () => { req.destroy(); reject(new Error('Timeout')); });
+        req.on('error', reject);
+        req.write(postData); req.end();
+      });
+    }
+
+    function downloadContent(url, headers) {
+      return new Promise((resolve, reject) => {
+        const parsed = new URL(url);
+        const opts = {
+          hostname: parsed.hostname, port: parsed.port || 443,
+          path: parsed.pathname + parsed.search, method: 'GET', headers
+        };
+        const req = https.request(opts, (res) => {
+          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            return downloadContent(res.headers.location, headers).then(resolve).catch(reject);
+          }
+          const chunks = [];
+          res.on('data', c => chunks.push(c));
+          res.on('end', () => {
+            const buf = Buffer.concat(chunks);
+            if (buf.length > 20 * 1024 * 1024) resolve(null);
+            else resolve(buf);
+          });
+        });
+        req.setTimeout(30000, () => { req.destroy(); reject(new Error('Download timeout')); });
+        req.on('error', reject);
+        req.end();
+      });
+    }
+
+    async function fetchAllData() {
+      console.log('[fetch] 开始获取数据...');
+      const typeNames = { 1: 'PDF', 2: '网页', 3: 'Word', 4: 'PPT', 6: '微信文章', 7: 'Markdown', 9: '图片', 11: '笔记', 99: '文件夹' };
+
+      const kbList = [];
+      let cursor = '';
+      do {
+        const result = await imaRequest('search_knowledge_base', { query: '', cursor, limit: 20 });
+        if (result.info_list) kbList.push(...result.info_list);
+        cursor = result.is_end ? null : result.next_cursor;
+      } while (cursor);
+
+      const targetKB = kbList.find(k => k.kb_name === TARGET_KB);
+      if (!targetKB) throw new Error('未找到知识库: ' + TARGET_KB);
+      console.log('[fetch] 找到 "' + TARGET_KB + '"');
+
+      let kbInfo = targetKB;
+      try {
+        const detail = await imaRequest('get_knowledge_base', { ids: [targetKB.kb_id] });
+        if (detail.infos && detail.infos[targetKB.kb_id]) kbInfo = { ...targetKB, ...detail.infos[targetKB.kb_id] };
+      } catch (e) { console.log('[fetch] 详情获取失败: ' + e.message); }
+
+      const items = [];
+      let itemCursor = '';
+      do {
+        const listResult = await imaRequest('get_knowledge_list', { knowledge_base_id: targetKB.kb_id, cursor: itemCursor, limit: 50 });
+        if (listResult.knowledge_list) items.push(...listResult.knowledge_list);
+        itemCursor = listResult.is_end ? null : listResult.next_cursor;
+      } while (itemCursor);
+      console.log('[fetch] ' + items.length + ' 条内容');
+
+      let success = 0, fail = 0;
+      for (const item of items) {
+        const mid = item.media_id;
+        if (!mid || item.media_type === 99) continue;
+        try {
+          const mediaInfo = await imaRequest('get_media_info', { media_id: mid });
+          const mt = mediaInfo.media_type || item.media_type;
+          item.mediaType = mt;
+          item.contentData = { type: 'unknown' };
+
+          if (mt === 9 && mediaInfo.url_info) {
+            const buf = await downloadContent(mediaInfo.url_info.url, mediaInfo.url_info.headers || {});
+            if (buf) {
+              const ext = mediaInfo.url_info.url.split('.').pop().split('?')[0] || 'png';
+              const mime = ext === 'jpg' ? 'image/jpeg' : ext === 'gif' ? 'image/gif' : ext === 'webp' ? 'image/webp' : 'image/png';
+              item.contentData = { type: 'image', dataUri: 'data:' + mime + ';base64,' + buf.toString('base64') };
+            }
+          }
+          if ((mt === 7 || mt === 3 || mt === 1) && mediaInfo.url_info) {
+            const buf = await downloadContent(mediaInfo.url_info.url, mediaInfo.url_info.headers || {});
+            if (buf) {
+              if (mt === 7) item.contentData = { type: 'markdown', text: buf.toString('utf-8').substring(0, 50000) };
+              else if (mt === 3) item.contentData = { type: 'document', label: 'Word文档', hint: '请使用 IMA 客户端查看完整内容' };
+              else if (mt === 1) item.contentData = { type: 'pdf', dataUri: 'data:application/pdf;base64,' + buf.toString('base64') };
+            }
+          }
+          if (mt === 2 && mediaInfo.url_info) item.contentData = { type: 'weburl', url: mediaInfo.url_info.url };
+          if (mt === 6) item.contentData = { type: 'weburl', url: item.raw_url || item.url || '', label: '微信文章' };
+          if (mt === 11 && mediaInfo.notebook_ext_info) {
+            const nb = mediaInfo.notebook_ext_info;
+            item.contentData = { type: 'markdown', text: nb.markdown_content || nb.content || '' };
+          }
+          success++;
+          console.log('  OK [' + (typeNames[mt] || '?') + '] ' + item.title);
+        } catch (e) {
+          fail++;
+          item.contentData = { type: 'error', message: e.message };
+          console.log('  FAIL ' + item.title + ': ' + e.message);
+        }
+        await new Promise(r => setTimeout(r, 100));
+      }
+      console.log('[fetch] 内容下载: ' + success + ' 成功, ' + fail + ' 失败');
+
+      const kb = {
+        id: targetKB.kb_id, name: targetKB.kb_name,
+        description: kbInfo.description || '', coverUrl: kbInfo.cover_url || '',
+        baseType: kbInfo.base_type || '', roleType: kbInfo.role_type || '', items
+      };
+      return { updatedAt: new Date().toISOString(), totalKBs: 1, totalItems: items.length, knowledgeBases: [kb] };
+    }
+
+    async function getData(forceRefresh) {
+      const now = Date.now();
+      if (!forceRefresh && cache.data && cache.updatedAt && (now - cache.updatedAt < cache.ttl)) return cache.data;
+      console.log('[cache] 缓存过期，重新获取...');
+      const data = await fetchAllData();
+      cache.data = data; cache.updatedAt = now;
+      return data;
+    }
+
+    app.get('/api/data', async (req, res) => {
+      try { res.json(await getData(req.query.refresh === '1')); }
+      catch (e) { res.status(500).json({ error: e.message }); }
+    });
+
+    app.post('/api/refresh', async (req, res) => {
+      try { const data = await getData(true); res.json({ success: true, updatedAt: data.updatedAt, totalItems: data.totalItems }); }
+      catch (e) { res.status(500).json({ error: e.message }); }
+    });
+
+    app.get('*', (req, res) => { res.sendFile(path.join(__dirname, 'public', 'index.html')); });
+
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log('\n🚀 GEO资讯服务已启动');
+      console.log('   端口: ' + PORT);
+      getData(true).then(d => console.log('✅ 预加载完成: ' + d.totalItems + ' 条')).catch(e => console.log('⚠️ ' + e.message));
+    });
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: geo-zixun-html
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>GEO资讯</title>
+    <style>
+      :root { --bg: #f7f8fa; --card-bg: #ffffff; --text: #1d1d1f; --text-secondary: #6e6e73; --text-tertiary: #999; --accent: #0071e3; --accent-hover: #0062cc; --accent-light: #e8f4fd; --green: #34c759; --orange: #ff9500; --border: #e5e5ea; --shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04); --shadow-lg: 0 4px 16px rgba(0,0,0,0.08), 0 2px 4px rgba(0,0,0,0.04); --radius: 12px; --radius-sm: 8px; }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+      .header { position: sticky; top: 0; z-index: 100; background: rgba(255,255,255,0.88); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; align-items: center; gap: 16px; }
+      .header .logo { font-size: 18px; font-weight: 700; white-space: nowrap; cursor: pointer; }
+      .search-box { flex: 1; max-width: 420px; position: relative; }
+      .search-box input { width: 100%; padding: 8px 16px 8px 36px; border: 1px solid var(--border); border-radius: 20px; font-size: 14px; background: var(--bg); outline: none; transition: all 0.2s; }
+      .search-box input:focus { background: #fff; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(0,113,227,0.1); }
+      .search-box .si { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--text-tertiary); font-size: 14px; }
+      .update-info { font-size: 12px; color: var(--text-tertiary); white-space: nowrap; margin-left: auto; }
+      .container { max-width: 960px; margin: 0 auto; padding: 24px; }
+      .stats-row { display: flex; gap: 12px; margin-bottom: 28px; justify-content: center; }
+      .stat-pill { background: #fff; border: 1px solid var(--border); border-radius: 20px; padding: 8px 18px; font-size: 13px; display: flex; align-items: center; gap: 6px; }
+      .stat-pill .sp-num { font-weight: 700; color: var(--accent); }
+      .items-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; }
+      .item-card { background: #fff; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; cursor: pointer; transition: all 0.2s; }
+      .item-card:hover { box-shadow: var(--shadow-lg); transform: translateY(-2px); }
+      .item-card .ic-thumb { height: 160px; background: var(--bg); display: flex; align-items: center; justify-content: center; overflow: hidden; position: relative; }
+      .item-card .ic-thumb img { width: 100%; height: 100%; object-fit: cover; }
+      .item-card .ic-thumb .ic-type-icon { font-size: 40px; opacity: 0.6; }
+      .item-card .ic-thumb .ic-type-badge { position: absolute; top: 8px; right: 8px; background: rgba(0,0,0,0.55); color: #fff; font-size: 11px; padding: 3px 8px; border-radius: 4px; backdrop-filter: blur(4px); }
+      .item-card .ic-body { padding: 14px 16px; }
+      .item-card .ic-title { font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 4px; }
+      .item-card .ic-meta { font-size: 12px; color: var(--text-tertiary); display: flex; align-items: center; gap: 8px; }
+      .filter-bar { display: flex; gap: 6px; margin-bottom: 18px; flex-wrap: wrap; }
+      .ftab { padding: 6px 14px; border: 1px solid var(--border); border-radius: 16px; background: #fff; font-size: 13px; cursor: pointer; color: var(--text-secondary); transition: all 0.12s; }
+      .ftab:hover { background: var(--bg); }
+      .ftab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+      .detail-view { animation: fadeIn 0.2s ease; }
+      @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+      .breadcrumb { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-tertiary); margin-bottom: 20px; }
+      .breadcrumb a { color: var(--accent); cursor: pointer; text-decoration: none; }
+      .breadcrumb a:hover { text-decoration: underline; }
+      .detail-card { background: #fff; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+      .detail-header { padding: 24px 28px 16px; border-bottom: 1px solid var(--border); }
+      .detail-header h1 { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
+      .detail-header .dh-meta { display: flex; gap: 14px; font-size: 13px; color: var(--text-tertiary); flex-wrap: wrap; }
+      .detail-body { padding: 28px; line-height: 1.8; font-size: 15px; }
+      .detail-body h1 { font-size: 24px; margin: 24px 0 14px; }
+      .detail-body h2 { font-size: 20px; margin: 20px 0 12px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+      .detail-body h3 { font-size: 17px; margin: 16px 0 10px; }
+      .detail-body p { margin: 10px 0; }
+      .detail-body ul, .detail-body ol { padding-left: 24px; margin: 8px 0; }
+      .detail-body li { margin: 4px 0; }
+      .detail-body table { width: 100%; border-collapse: collapse; margin: 14px 0; }
+      .detail-body th, .detail-body td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; font-size: 14px; }
+      .detail-body th { background: var(--bg); font-weight: 600; }
+      .detail-body code { background: #f5f5f7; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+      .detail-body pre { background: #1d1d1f; color: #f5f5f7; padding: 16px; border-radius: var(--radius-sm); overflow-x: auto; margin: 14px 0; }
+      .detail-body pre code { background: none; color: inherit; padding: 0; }
+      .detail-body blockquote { border-left: 3px solid var(--accent); padding: 6px 14px; margin: 14px 0; color: var(--text-secondary); background: var(--accent-light); border-radius: 0 6px 6px 0; }
+      .detail-body a { color: var(--accent); text-decoration: none; }
+      .detail-body a:hover { text-decoration: underline; }
+      .detail-body img { max-width: 100%; border-radius: var(--radius-sm); margin: 12px 0; border: 1px solid var(--border); }
+      .detail-body .image-viewer { text-align: center; }
+      .detail-body .image-viewer img { max-width: 100%; max-height: 80vh; border-radius: var(--radius-sm); border: 1px solid var(--border); cursor: zoom-in; }
+      .detail-body .image-viewer img.zoomed { cursor: zoom-out; max-height: none; }
+      .detail-body .ext-link-card { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 20px; text-align: center; }
+      .detail-body .ext-link-card a { display: inline-block; padding: 10px 24px; background: var(--accent); color: #fff; border-radius: 8px; text-decoration: none; font-weight: 600; margin-top: 8px; }
+      .detail-body .ext-link-card a:hover { background: var(--accent-hover); text-decoration: none; }
+      .detail-body .download-card { background: var(--accent-light); border-radius: var(--radius-sm); padding: 20px; text-align: center; }
+      .detail-body .download-card a { display: inline-block; padding: 10px 24px; background: var(--accent); color: #fff; border-radius: 8px; text-decoration: none; font-weight: 600; margin-top: 8px; }
+      .detail-body .download-card a:hover { background: var(--accent-hover); text-decoration: none; }
+      .empty-state { text-align: center; padding: 60px 20px; color: var(--text-tertiary); }
+      .empty-state .es-icon { font-size: 48px; margin-bottom: 12px; }
+      .loading-state { text-align: center; padding: 60px 20px; }
+      .spinner { display: inline-block; width: 32px; height: 32px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.6s linear infinite; margin-bottom: 12px; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      @media (max-width: 768px) { .container { padding: 16px; } .items-grid { grid-template-columns: 1fr; } .detail-body { padding: 16px; } .search-box { display: none; } }
+    </style>
+    </head>
+    <body>
+    <header class="header">
+      <div class="logo" onclick="showHome()">GEO资讯</div>
+      <div class="search-box"><span class="si">🔍</span><input type="text" id="search-input" placeholder="搜索知识内容..." oninput="handleSearch()"></div>
+      <div class="update-info" id="update-info"></div>
+    </header>
+    <div class="container" id="app"><div class="loading-state"><div class="spinner"></div><p style="color:var(--text-tertiary)">正在加载知识库...</p></div></div>
+    <script>
+    let APP={data:null,view:'home',currentKBId:null,currentItemId:null,filterType:'all',searchTerm:''};
+    async function loadData(){const r=await fetch('/api/data');if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}
+    function renderMD(t){if(!t)return'<p style="color:var(--text-tertiary)">暂无内容</p>';var h=t;h=h.replace(/```([\\w]*)\\n([\\s\\S]*?)```/g,'<pre><code>$2</code></pre>');h=h.replace(/`([^`]+)`/g,'<code>$1</code>');h=h.replace(/!\\[([^\\]]*)\\]\\(([^)]+)\\)/g,'<img src="$2" alt="$1" style="max-width:100%;border-radius:8px;">');h=h.replace(/^#### (.+)/gm,'<h4>$1</h4>');h=h.replace(/^### (.+)/gm,'<h3>$1</h3>');h=h.replace(/^## (.+)/gm,'<h2>$1</h2>');h=h.replace(/^# (.+)/gm,'<h1>$1</h1>');h=h.replace(/\\*\\*(.+?)\\*\\*/g,'<strong>$1</strong>');h=h.replace(/\\*(.+?)\\*/g,'<em>$1</em>');h=h.replace(/^> (.+)/gm,'<blockquote>$1</blockquote>');h=h.replace(/^---$/gm,'<hr>');h=h.replace(/^[*-] (.+)/gm,'<li>$1</li>');h=h.replace(/^\\d+\\. (.+)/gm,'<li>$1</li>');h=h.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');h=h.replace(/\\n\\n/g,'</p><p>');h=h.replace(/\\n/g,'<br>');h='<p>'+h+'</p>';h=h.replace(/<p>\\s*<\\/p>/g,'');h=h.replace(/(<li>[\\s\\S]*?<\\/li>)/g,'<ul>$1</ul>');h=h.replace(/<\\/ul>\\s*<ul>/g,'');return h;}
+    const TYPE_INFO={1:{label:'PDF',icon:'📕',color:'#ff3b30'},2:{label:'网页',icon:'🌐',color:'#0071e3'},3:{label:'Word',icon:'📝',color:'#2196f3'},4:{label:'PPT',icon:'📊',color:'#ff9500'},6:{label:'微信文章',icon:'💬',color:'#07c160'},7:{label:'Markdown',icon:'📋',color:'#6e6e73'},9:{label:'图片',icon:'🖼️',color:'#af52de'},11:{label:'笔记',icon:'📒',color:'#34c759'},99:{label:'文件夹',icon:'📁',color:'#ff9500'}};
+    function typeInfo(mt){return TYPE_INFO[mt]||{label:'附件',icon:'📎',color:'#999'};}
+    function render(){if(!APP.data)return;if(APP.view==='home')renderHome();else if(APP.view==='kb')renderKB();else if(APP.view==='item')renderItem();renderUpdateInfo();}
+    function renderUpdateInfo(){if(!APP.data||!APP.data.updatedAt)return;var d=new Date(APP.data.updatedAt);document.getElementById('update-info').textContent='更新于 '+d.toLocaleString('zh-CN');}
+    function renderHome(){var d=APP.data;var allItems=d.knowledgeBases.flatMap(function(kb){return kb.items.map(function(item){return Object.assign({},item,{kbName:kb.name,kbId:kb.id})})});var items=allItems;if(APP.filterType!=='all'){var typeMap={image:[9],document:[1,3,4,7],note:[11],web:[2,6]};var types=typeMap[APP.filterType]||[];items=items.filter(function(i){return types.includes(i.media_type)});}if(APP.searchTerm){var q=APP.searchTerm.toLowerCase();items=items.filter(function(i){return(i.title||'').toLowerCase().includes(q)});}var html='<div class="stats-row"><div class="stat-pill">📚 知识库 <span class="sp-num">'+d.totalKBs+'</span></div><div class="stat-pill">📄 内容 <span class="sp-num">'+d.totalItems+'</span></div></div><div class="filter-bar"><button class="ftab '+(APP.filterType==='all'?'active':'')+'" onclick="setFilter(\'all\')">全部</button><button class="ftab '+(APP.filterType==='image'?'active':'')+'" onclick="setFilter(\'image\')">🖼️ 图片</button><button class="ftab '+(APP.filterType==='document'?'active':'')+'" onclick="setFilter(\'document\')">📄 文档</button><button class="ftab '+(APP.filterType==='web'?'active':'')+'" onclick="setFilter(\'web\')">🌐 网页</button><button class="ftab '+(APP.filterType==='note'?'active':'')+'" onclick="setFilter(\'note\')">📒 笔记</button></div>';if(items.length===0){html+='<div class="empty-state"><div class="es-icon">📭</div><p>暂无内容</p></div>';}else{html+='<div class="items-grid">';items.forEach(function(item){var ti=typeInfo(item.media_type);var hasImage=item.contentData&&item.contentData.type==='image';var thumbHtml=hasImage?'<img src="'+item.contentData.dataUri+'" alt="'+esc(item.title)+'" loading="lazy">':'<div class="ic-type-icon">'+ti.icon+'</div>';var badge='<div class="ic-type-badge">'+ti.label+'</div>';html+='<div class="item-card" onclick="showItem(\''+item.kbId+'\',\''+esc(item.media_id)+'\')"><div class="ic-thumb">'+thumbHtml+badge+'</div><div class="ic-body"><div class="ic-title">'+esc(item.title||'未命名')+'</div><div class="ic-meta"><span>'+ti.icon+' '+ti.label+'</span><span>📂 '+esc(item.kbName)+'</span></div></div></div>';});html+='</div>';}document.getElementById('app').innerHTML=html;}
+    function renderKB(){var kb=APP.data.knowledgeBases.find(function(k){return k.id===APP.currentKBId});if(!kb)return showHome();var items=kb.items||[];if(APP.filterType!=='all'){var typeMap={image:[9],document:[1,3,4,7],note:[11],web:[2,6]};var types=typeMap[APP.filterType]||[];items=items.filter(function(i){return types.includes(i.media_type)});}if(APP.searchTerm){var q=APP.searchTerm.toLowerCase();items=items.filter(function(i){return(i.title||'').toLowerCase().includes(q)});}var html='<div class="breadcrumb"><a onclick="showHome()">全部知识库</a> / <span>'+esc(kb.name)+'</span></div><h2 style="margin-bottom:6px">'+esc(kb.name)+'</h2><p style="color:var(--text-tertiary);font-size:13px;margin-bottom:18px">'+(esc(kb.description||'')||'个人知识库')+' · '+items.length+' / '+kb.items.length+' 条</p><div class="filter-bar"><button class="ftab '+(APP.filterType==='all'?'active':'')+'" onclick="setFilter(\'all\')">全部</button><button class="ftab '+(APP.filterType==='image'?'active':'')+'" onclick="setFilter(\'image\')">🖼️ 图片</button><button class="ftab '+(APP.filterType==='document'?'active':'')+'" onclick="setFilter(\'document\')">📄 文档</button><button class="ftab '+(APP.filterType==='web'?'active':'')+'" onclick="setFilter(\'web\')">🌐 网页</button><button class="ftab '+(APP.filterType==='note'?'active':'')+'" onclick="setFilter(\'note\')">📒 笔记</button></div>';if(items.length===0){html+='<div class="empty-state"><div class="es-icon">📭</div><p>暂无内容</p></div>';}else{html+='<div class="items-grid">';items.forEach(function(item){var ti=typeInfo(item.media_type);var hasImage=item.contentData&&item.contentData.type==='image';var thumbHtml=hasImage?'<img src="'+item.contentData.dataUri+'" alt="'+esc(item.title)+'" loading="lazy">':'<div class="ic-type-icon">'+ti.icon+'</div>';var badge='<div class="ic-type-badge">'+ti.label+'</div>';html+='<div class="item-card" onclick="showItem(\''+kb.id+'\',\''+esc(item.media_id)+'\')"><div class="ic-thumb">'+thumbHtml+badge+'</div><div class="ic-body"><div class="ic-title">'+esc(item.title||'未命名')+'</div><div class="ic-meta"><span>'+ti.icon+' '+ti.label+'</span></div></div></div>';});html+='</div>';}document.getElementById('app').innerHTML=html;}
+    function renderItem(){var kb=APP.data.knowledgeBases.find(function(k){return k.id===APP.currentKBId});if(!kb)return showHome();var item=kb.items.find(function(i){return i.media_id===APP.currentItemId});if(!item)return showKB(APP.currentKBId);var ti=typeInfo(item.media_type);var cd=item.contentData;var contentHtml='';if(!cd){contentHtml='<div class="empty-state"><div class="es-icon">📭</div><p>暂无内容</p></div>';}else if(cd.type==='image'){contentHtml='<div class="image-viewer"><img src="'+cd.dataUri+'" onclick="this.classList.toggle(\'zoomed\')" alt="'+esc(item.title)+'"></div>';}else if(cd.type==='markdown'){contentHtml='<div class="detail-body">'+renderMD(cd.text)+'</div>';}else if(cd.type==='weburl'){contentHtml='<div class="detail-body"><div class="ext-link-card"><p style="font-size:16px;margin-bottom:8px">🔗 外部链接</p><p style="color:var(--text-tertiary);font-size:13px;word-break:break-all;margin-bottom:12px">'+esc(cd.url)+'</p><a href="'+esc(cd.url)+'" target="_blank" rel="noopener">打开网页 ↗</a></div></div>';}else if(cd.type==='pdf'){contentHtml='<div class="detail-body"><div class="download-card"><p style="font-size:16px;margin-bottom:8px">📕 PDF 文档</p><a href="'+cd.dataUri+'" download="'+esc(item.title||'document')+'.pdf">下载 PDF 📥</a></div></div>';}else if(cd.type==='document'){contentHtml='<div class="detail-body"><div class="download-card"><p style="font-size:16px;margin-bottom:8px">📝 '+esc(cd.label||'文档')+'</p><p style="color:var(--text-tertiary);font-size:13px">'+esc(cd.hint||'')+'</p></div></div>';}else if(cd.type==='error'){contentHtml='<div class="empty-state"><div class="es-icon">⚠️</div><p>内容加载失败: '+esc(cd.message)+'</p></div>';}else{contentHtml='<div class="empty-state"><div class="es-icon">📭</div><p>暂不支持预览此类型内容</p></div>';}var html='<div class="detail-view"><div class="breadcrumb"><a onclick="showHome()">全部知识库</a> / <a onclick="showKB(\''+kb.id+'\')">'+esc(kb.name)+'</a> / <span>'+esc(item.title||'未命名')+'</span></div><div class="detail-card"><div class="detail-header"><h1>'+ti.icon+' '+esc(item.title||'未命名')+'</h1><div class="dh-meta"><span>📂 '+esc(kb.name)+'</span><span>'+ti.icon+' '+ti.label+'</span></div></div>'+contentHtml+'</div></div>';document.getElementById('app').innerHTML=html;window.scrollTo(0,0);}
+    function showHome(){APP.view='home';APP.currentKBId=null;APP.currentItemId=null;APP.filterType='all';APP.searchTerm='';document.getElementById('search-input').value='';render();window.scrollTo(0,0);}
+    function showKB(kbId){APP.view='kb';APP.currentKBId=kbId;APP.currentItemId=null;APP.filterType='all';render();window.scrollTo(0,0);}
+    function showItem(kbId,mediaId){APP.view='item';APP.currentKBId=kbId;APP.currentItemId=mediaId;render();}
+    function setFilter(type){APP.filterType=type;render();}
+    function handleSearch(){APP.searchTerm=document.getElementById('search-input').value;render();}
+    function esc(str){if(!str)return'';var d=document.createElement('div');d.textContent=String(str);return d.innerHTML;}
+    (async function(){try{APP.data=await loadData();APP.view='home';render();}catch(e){document.getElementById('app').innerHTML='<div class="empty-state"><div class="es-icon">⚠️</div><h3>加载失败</h3><p>'+esc(e.message)+'</p><button onclick="location.reload()" style="margin-top:12px;padding:8px 20px;background:var(--accent);color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:14px">重试</button></div>';}})();
+    </script>
+    </body>
+    </html>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: geo-zixun
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: geo-zixun
+  template:
+    metadata:
+      labels:
+        app: geo-zixun
+    spec:
+      containers:
+      - name: app
+        image: node:22-alpine
+        workingDir: /app
+        command: ["sh", "-c"]
+        args:
+          - |
+            mkdir -p /app/public
+            cd /app && npm install express && node server.js
+        ports:
+        - containerPort: 3000
+        env:
+        - name: NODE_TLS_REJECT_UNAUTHORIZED
+          value: "0"
+        volumeMounts:
+        - name: server
+          mountPath: /app/server.js
+          subPath: server.js
+        - name: server
+          mountPath: /app/package.json
+          subPath: package.json
+        - name: html
+          mountPath: /app/public/index.html
+          subPath: index.html
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      volumes:
+      - name: server
+        configMap:
+          name: geo-zixun-server
+      - name: html
+        configMap:
+          name: geo-zixun-html
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: geo-zixun
+spec:
+  selector:
+    app: geo-zixun
+  ports:
+  - port: 80
+    targetPort: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: geo-zixun
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+  - host: ""
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: geo-zixun
+            port:
+              number: 80
