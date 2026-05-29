@@ -1,0 +1,13 @@
+{
+  "name": "ima-kb-viewer",
+  "version": "1.0.0",
+  "description": "IMA知识库在线查看器 - 动态读取ima OpenAPI",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  }
+}
